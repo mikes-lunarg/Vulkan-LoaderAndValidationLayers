@@ -1184,15 +1184,22 @@ static bool ValidateDrawState(layer_data *dev_data, GLOBAL_CB_NODE *cb_node, CMD
                 cvdescriptorset::DescriptorSet *descriptor_set = state.boundDescriptorSets[setIndex];
                 // Validate the draw-time state for this descriptor set
                 std::string err_str;
-                if (!descriptor_set->IsPushDescriptor() &&
-                    !descriptor_set->ValidateDrawState(set_binding_pair.second, state.dynamicOffsets[setIndex], cb_node, function,
-                                                       &err_str)) {
-                    auto set = descriptor_set->GetSet();
-                    result |= log_msg(dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT,
-                                      VK_DEBUG_REPORT_OBJECT_TYPE_DESCRIPTOR_SET_EXT, HandleToUint64(set), __LINE__,
-                                      DRAWSTATE_DESCRIPTOR_SET_NOT_UPDATED, "DS",
-                                      "Descriptor set 0x%" PRIx64 " encountered the following validation error at %s time: %s",
-                                      HandleToUint64(set), function, err_str.c_str());
+                if (!descriptor_set->IsPushDescriptor()) {
+                    // For the "bindless" style resource usage with many descriptors, need to optimize command <-> descriptor
+                    // binding
+                    const cvdescriptorset::PrefilterBindRequestMap reduced_map(*descriptor_set, set_binding_pair.second, cb_node,
+                                                                               pPipe);
+                    const auto &binding_req_map = reduced_map.Map();
+
+                    if (!descriptor_set->ValidateDrawState(binding_req_map, state.dynamicOffsets[setIndex], cb_node, function,
+                                                           &err_str)) {
+                        auto set = descriptor_set->GetSet();
+                        result |= log_msg(dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT,
+                                          VK_DEBUG_REPORT_OBJECT_TYPE_DESCRIPTOR_SET_EXT, HandleToUint64(set), __LINE__,
+                                          DRAWSTATE_DESCRIPTOR_SET_NOT_UPDATED, "DS",
+                                          "Descriptor set 0x%" PRIx64 " encountered the following validation error at %s time: %s",
+                                          HandleToUint64(set), function, err_str.c_str());
+                    }
                 }
             }
         }
@@ -1214,10 +1221,14 @@ static void UpdateDrawState(layer_data *dev_data, GLOBAL_CB_NODE *cb_state, cons
             // Pull the set node
             cvdescriptorset::DescriptorSet *descriptor_set = state.boundDescriptorSets[setIndex];
             if (!descriptor_set->IsPushDescriptor()) {
+                // For the "bindless" style resource usage with many descriptors, need to optimize command <-> descriptor binding
+                const cvdescriptorset::PrefilterBindRequestMap reduced_map(*descriptor_set, set_binding_pair.second, cb_state);
+                const auto &binding_req_map = reduced_map.Map();
+
                 // Bind this set and its active descriptor resources to the command buffer
-                descriptor_set->BindCommandBuffer(cb_state, set_binding_pair.second);
+                descriptor_set->BindCommandBuffer(cb_state, binding_req_map);
                 // For given active slots record updated images & buffers
-                descriptor_set->GetStorageUpdates(set_binding_pair.second, &cb_state->updateBuffers, &cb_state->updateImages);
+                descriptor_set->GetStorageUpdates(binding_req_map, &cb_state->updateBuffers, &cb_state->updateImages);
             }
         }
     }
@@ -1762,6 +1773,7 @@ static void ResetCommandBufferState(layer_data *dev_data, const VkCommandBuffer 
         pCB->hasDrawCmd = false;
         pCB->state = CB_NEW;
         pCB->submitCount = 0;
+        pCB->image_layout_change_count = 0;
         pCB->status = 0;
         pCB->static_status = 0;
         pCB->viewportMask = 0;
@@ -5369,6 +5381,12 @@ VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
     return result;
 }
+static void PostCallRecordEndCommandBuffer(layer_data *dev_data, GLOBAL_CB_NODE *cb_state) {
+    for (auto descriptor_set : cb_state->validated_descriptor_sets) {
+        descriptor_set->ClearCachedValidation(cb_state);
+    }
+    cb_state->validated_descriptor_sets.clear();
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer commandBuffer) {
     bool skip = false;
@@ -5394,6 +5412,7 @@ VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer commandBuffer) {
         lock.unlock();
         auto result = dev_data->dispatch_table.EndCommandBuffer(commandBuffer);
         lock.lock();
+        PostCallRecordEndCommandBuffer(dev_data, pCB);
         if (VK_SUCCESS == result) {
             pCB->state = CB_RECORDED;
         }
@@ -5709,6 +5728,7 @@ static void PreCallRecordCmdBindDescriptorSets(layer_data *device_data, GLOBAL_C
                                           pDynamicOffsets + total_dynamic_descriptors + set_dynamic_descriptor_count);
                 total_dynamic_descriptors += set_dynamic_descriptor_count;
             }
+            cb_state->validated_descriptor_sets.insert(descriptor_set);
         }
         // For any previously bound sets, need to set them to "invalid" if they were disturbed by this update
         if (firstSet > 0) {
