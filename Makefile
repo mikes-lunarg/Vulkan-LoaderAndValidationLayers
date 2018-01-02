@@ -25,7 +25,7 @@ $(LVL_TARGET): $(LVL_MAKEFILE)
 
 test tests: $(LVL_TARGET)
 	#cd $(LVL_TESTS_DIR) && ./run_all_tests.sh
-	cd $(LVL_TESTS_DIR) && ./vk_layer_validation_tests
+	cd $(LVL_TESTS_DIR) && VK_LAYER_PATH="`pwd`/layers" ./vk_layer_validation_tests
 
 clean:
 	echo TODO
